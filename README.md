@@ -294,6 +294,43 @@ uv run python -m student answer_dataset \
 
 ---
 
+## Known Deviations from the Subject Spec
+
+### `question_str` instead of `question` in `MinimalSearchResults`
+
+The subject PDF specifies a field named `question` in the `MinimalSearchResults` model. This implementation uses `question_str` instead:
+
+```python
+class MinimalSearchResults(BaseModel):
+    question_id: str
+    question_str: str   # spec says 'question', moulinette requires 'question_str'
+    retrieved_sources: List[MinimalSource]
+```
+
+The moulinette binary validates output JSON against `question_str`, not `question`. Using `question` causes the moulinette to reject the submission. This was verified empirically — the moulinette README uses `question_str` while the PDF uses `question`. The implementation follows what the moulinette actually requires.
+
+### Answer generation latency with local model
+
+The subject requires answers in ≤ 2 seconds per question and specifies `Qwen/Qwen3-0.6B` as the generation model. Running Qwen locally via the `transformers` pipeline takes significantly longer than 2 seconds per answer and has a cold-start cost exceeding the 60-second limit.
+
+The default backend (`auto`) resolves this by preferring a low-latency OpenAI-compatible endpoint (e.g., a running vLLM server) and falling back to an extractive answer if none is configured. The extractive fallback meets the latency constraint but does not use Qwen for generation.
+
+To use Qwen/Qwen3-0.6B locally (at the cost of latency):
+
+```bash
+STUDENT_GENERATION_BACKEND=hf_local uv run python -m student answer "your question"
+```
+
+To use a vLLM-served Qwen instance (meets both constraints):
+
+```bash
+STUDENT_OPENAI_BASE_URL=http://localhost:8000/v1 \
+STUDENT_OPENAI_MODEL=Qwen/Qwen3-0.6B \
+uv run python -m student answer_dataset ...
+```
+
+---
+
 ## Resources
 
 ### Documentation

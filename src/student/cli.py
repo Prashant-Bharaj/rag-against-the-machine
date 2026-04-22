@@ -252,7 +252,9 @@ class StudentCLI:
             sys.exit(1)
 
         answered: list[MinimalAnswer] = []
-        for result in tqdm(search_results.search_results, desc="Generating answers"):
+        for result in tqdm(
+            search_results.search_results, desc="Generating answers"
+        ):
             chunks = get_chunks_for_sources(
                 result.retrieved_sources, processed_path
             )

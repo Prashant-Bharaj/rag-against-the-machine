@@ -57,11 +57,10 @@ class StudentSearchResults(BaseModel):
     k: int
 
 
-class StudentSearchResultsAndAnswer(BaseModel):
+class StudentSearchResultsAndAnswer(StudentSearchResults):
     """Search results with generated answers for all questions."""
 
-    search_results: List[MinimalAnswer]
-    k: int
+    search_results: List[MinimalAnswer]  # type: ignore[assignment]
 
 
 class Chunk(BaseModel):

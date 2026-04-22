@@ -158,7 +158,9 @@ def chunk_python(
         if start > prev_end:
             gap = source[prev_end:start]
             if gap.strip():
-                chunks.extend(sliding_window(gap, file_path, prev_end, max_size))
+                chunks.extend(
+                    sliding_window(gap, file_path, prev_end, max_size)
+                )
 
         node_text = source[start:end]
         if len(node_text) <= max_size:
@@ -174,7 +176,9 @@ def chunk_python(
                     )
                 )
         else:
-            chunks.extend(sliding_window(node_text, file_path, start, max_size))
+            chunks.extend(
+                sliding_window(node_text, file_path, start, max_size)
+            )
 
         prev_end = end
 
@@ -244,7 +248,9 @@ def chunk_text(
                         )
                     )
                 else:
-                    chunks.extend(sliding_window(part, file_path, actual_start, max_size))
+                    chunks.extend(
+                        sliding_window(part, file_path, actual_start, max_size)
+                    )
                 section_offset += len(part)
 
     if not chunks:
@@ -304,7 +310,10 @@ def chunk_file(
         return []
 
     return [
-        ch.model_copy(update={"chunk_id": chunk_id_start + i, "index_type": index_type})
+        ch.model_copy(update={
+            "chunk_id": chunk_id_start + i,
+            "index_type": index_type,
+        })
         for i, ch in enumerate(raw_chunks)
     ]
 
