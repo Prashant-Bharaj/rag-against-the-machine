@@ -1,0 +1,28 @@
+.PHONY: install run debug clean lint lint-strict
+
+PYTHON = uv run python
+MODULE = student
+
+install:
+	uv sync
+	uv pip install -e .
+
+run:
+	$(PYTHON) -m $(MODULE)
+
+debug:
+	$(PYTHON) -m pdb -m $(MODULE)
+
+clean:
+	find . -type d -name __pycache__ -exec rm -rf {} + 2>/dev/null; \
+	find . -type d -name .mypy_cache -exec rm -rf {} + 2>/dev/null; \
+	find . -name "*.pyc" -delete 2>/dev/null; true
+
+lint:
+	uv run flake8 src
+	uv run mypy src --warn-return-any --warn-unused-ignores --ignore-missing-imports \
+	       --disallow-untyped-defs --check-untyped-defs
+
+lint-strict:
+	uv run flake8 src
+	uv run mypy src --strict

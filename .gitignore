@@ -1,0 +1,25 @@
+__pycache__/
+*.pyc
+*.pyo
+.mypy_cache/
+.ruff_cache/
+.venv/
+*.egg-info/
+dist/
+build/
+data/raw/
+data/processed/
+data/output/
+.env
+*.bin
+*.safetensors
+en.subject.pdf
+
+# Local evaluation artifacts (not part of submission)
+moulinette-ubuntu
+moulinettes.zip
+instructions_readme/
+datasets_public/
+datasets_public.zip
+vllm-0.10.1.zip
+docs/
