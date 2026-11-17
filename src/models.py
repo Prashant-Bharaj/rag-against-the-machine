@@ -40,7 +40,7 @@ class MinimalSearchResults(BaseModel):
     """Search results for a single question."""
 
     question_id: str
-    question_str: str
+    question: str
     retrieved_sources: List[MinimalSource]
 
 
@@ -57,10 +57,11 @@ class StudentSearchResults(BaseModel):
     k: int
 
 
-class StudentSearchResultsAndAnswer(StudentSearchResults):
+class StudentSearchResultsAndAnswer(BaseModel):
     """Search results with generated answers for all questions."""
 
-    search_results: List[MinimalAnswer]  # type: ignore[assignment]
+    search_results: List[MinimalAnswer]
+    k: int
 
 
 class Chunk(BaseModel):
@@ -72,3 +73,4 @@ class Chunk(BaseModel):
     end_char: int
     content: str
     index_type: Literal["code", "docs", ""]
+    context: str = ""

@@ -3,19 +3,20 @@
 import os
 import sys
 from pathlib import Path
-from typing import List, Optional, Tuple
+from typing import List, Tuple
 
 import bm25s
 from tqdm import tqdm
 
-from student.chunker import (
+from src.tokenizer import path_tokens, tokenize
+from src.chunker import (
     DOCS_EXTENSIONS,
     PYTHON_EXTENSIONS,
     SKIP_EXTENSIONS,
     MAX_FILE_SIZE,
     chunk_file,
 )
-from student.models import Chunk
+from src.models import Chunk
 
 CHUNKS_DIR = "chunks"
 BM25_DIR = "bm25_index"
@@ -57,21 +58,40 @@ def _collect_files(repo_path: str) -> List[str]:
     return sorted(files)
 
 
-def _build_bm25(chunks: List[Chunk], stopwords: str = "en") -> bm25s.BM25:
+def chunk_index_tokens(chunk: Chunk) -> List[str]:
+    """Build the token list that represents a chunk in the BM25 index.
+
+    The file path and enclosing class are added to the chunk text so a
+    question naming a module ("the keye model") or a class
+    ("GPUModelRunner") can match chunks that never spell it out.
+
+    Args:
+        chunk: The chunk to tokenize.
+
+    Returns:
+        Tokens for the chunk.
+    """
+    return (
+        path_tokens(chunk.file_path)
+        + tokenize(chunk.context)
+        + tokenize(chunk.content)
+    )
+
+
+def _build_bm25(chunks: List[Chunk]) -> bm25s.BM25:
     """Build a BM25 index from a list of chunks.
 
     Args:
         chunks: List of Chunk objects to index.
-        stopwords: Stopword language string for bm25s.tokenize, or 'none'.
 
     Returns:
         A fitted BM25 retriever.
     """
-    corpus = [c.content for c in chunks]
-    sw: Optional[str] = None if stopwords == "none" else stopwords
-    tokenized = bm25s.tokenize(corpus, stopwords=sw, show_progress=False)
+    corpus = [
+        chunk_index_tokens(c) for c in tqdm(chunks, desc="Tokenizing")
+    ]
     retriever = bm25s.BM25()
-    retriever.index(tokenized)
+    retriever.index(corpus, show_progress=False)
     return retriever
 
 
@@ -149,14 +169,14 @@ def index(
     # Build and save BM25 indexes
     if code_chunks:
         print("Building BM25 code index...")
-        code_retriever = _build_bm25(code_chunks, stopwords="none")
+        code_retriever = _build_bm25(code_chunks)
         code_index_path = str(bm25_dir / CODE_INDEX_DIR)
         code_retriever.save(code_index_path, corpus=None)
         print(f"Code index saved to {code_index_path}")
 
     if docs_chunks:
         print("Building BM25 docs index...")
-        docs_retriever = _build_bm25(docs_chunks, stopwords="en")
+        docs_retriever = _build_bm25(docs_chunks)
         docs_index_path = str(bm25_dir / DOCS_INDEX_DIR)
         docs_retriever.save(docs_index_path, corpus=None)
         print(f"Docs index saved to {docs_index_path}")

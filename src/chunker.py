@@ -3,9 +3,9 @@
 import ast
 import re
 from pathlib import Path
-from typing import List, Optional
+from typing import Callable, List, Optional, Tuple
 
-from student.models import Chunk
+from src.models import Chunk
 
 # File extensions to handle
 PYTHON_EXTENSIONS = {".py", ".pyi"}
@@ -63,6 +63,9 @@ def sliding_window(
     chunks: List[Chunk] = []
     pos = 0
     length = len(content)
+    max_size = max(1, max_size)
+    # The overlap must stay below the window size or the window never moves.
+    overlap = min(overlap, max_size // 4)
 
     while pos < length:
         end = min(pos + max_size, length)
@@ -83,6 +86,116 @@ def sliding_window(
         pos = end - overlap
 
     return chunks
+
+
+_DEF_NODES = (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)
+
+
+def _first_line(node: ast.stmt) -> int:
+    """Return the first line of a definition, including its decorators.
+
+    Args:
+        node: A function or class definition node.
+
+    Returns:
+        1-based line number where the definition starts.
+    """
+    decorators: List[ast.expr] = getattr(node, "decorator_list", [])
+    lines: List[int] = [node.lineno] + [d.lineno for d in decorators]
+    return min(lines)
+
+
+def _split_class(
+    node: ast.ClassDef,
+    source: str,
+    file_path: str,
+    start: int,
+    end: int,
+    max_size: int,
+    line_to_char: Callable[[int], int],
+    end_line_to_char: Callable[[int], int],
+) -> List[Chunk]:
+    """Split an oversized class into chunks along its member boundaries.
+
+    The class body is cut into segments (header, attributes, methods),
+    which are packed greedily into chunks of at most ``max_size``
+    characters. Segments that are still too large are split recursively
+    (nested classes) or with a sliding window. Every chunk records the
+    class name as context so retrieval can match it.
+
+    Args:
+        node: The class definition node.
+        source: Full file text.
+        file_path: Path used in chunk metadata.
+        start: Character offset where the class starts.
+        end: Character offset where the class ends.
+        max_size: Maximum chunk size in characters.
+        line_to_char: Maps a 1-based line to its first character offset.
+        end_line_to_char: Maps a 1-based line to the offset after it.
+
+    Returns:
+        List of Chunk objects covering the class.
+    """
+    bounds: List[int] = [start]
+    members: dict[int, ast.stmt] = {}
+    for child in node.body:
+        if isinstance(child, _DEF_NODES) and child.end_lineno is not None:
+            c_start = max(line_to_char(_first_line(child)), bounds[-1])
+            c_end = end_line_to_char(child.end_lineno)
+            if c_start > bounds[-1]:
+                bounds.append(c_start)
+            members[c_start] = child
+            bounds.append(c_end)
+    if bounds[-1] < end:
+        bounds.append(end)
+
+    chunks: List[Chunk] = []
+    pack_start = pack_end = start
+
+    def flush() -> None:
+        """Emit the segments packed so far as one chunk."""
+        if pack_end > pack_start and source[pack_start:pack_end].strip():
+            chunks.append(
+                Chunk(
+                    chunk_id=0,
+                    file_path=file_path,
+                    start_char=pack_start,
+                    end_char=pack_end,
+                    content=source[pack_start:pack_end],
+                    index_type="",
+                )
+            )
+
+    for seg_start, seg_end in zip(bounds, bounds[1:]):
+        if seg_end - pack_start <= max_size:
+            pack_end = seg_end
+            continue
+        flush()
+        if seg_end - seg_start <= max_size:
+            pack_start, pack_end = seg_start, seg_end
+            continue
+        member = members.get(seg_start)
+        if isinstance(member, ast.ClassDef):
+            chunks.extend(
+                _split_class(
+                    member, source, file_path, seg_start, seg_end,
+                    max_size, line_to_char, end_line_to_char,
+                )
+            )
+        else:
+            chunks.extend(
+                sliding_window(
+                    source[seg_start:seg_end], file_path, seg_start, max_size
+                )
+            )
+        pack_start = pack_end = seg_end
+    flush()
+
+    context = f"class {node.name}"
+    return [
+        ch if ch.context else ch.model_copy(update={"context": context})
+        for ch in chunks
+    ]
 
 
 def chunk_python(
@@ -124,26 +237,18 @@ def chunk_python(
         return sliding_window(source, file_path, 0, max_size)
 
     # Collect top-level node boundaries
-    top_level: List[tuple[int, int]] = []
+    top_level: List[Tuple[int, int, ast.stmt]] = []
     for node in ast.iter_child_nodes(tree):
-        if isinstance(
-            node,
-            (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef),
-        ):
-            if (
-                hasattr(node, "lineno")
-                and hasattr(node, "end_lineno")
-                and node.end_lineno is not None
-            ):
-                start = line_to_char(node.lineno)
-                end = end_line_to_char(node.end_lineno)
-                top_level.append((start, end))
+        if isinstance(node, _DEF_NODES) and node.end_lineno is not None:
+            start = line_to_char(_first_line(node))
+            end = end_line_to_char(node.end_lineno)
+            top_level.append((start, end, node))
 
     if not top_level:
         return sliding_window(source, file_path, 0, max_size)
 
     # Sort by start position
-    top_level.sort()
+    top_level.sort(key=lambda t: t[0])
 
     # Collect leading module-level code (before first node)
     first_start = top_level[0][0]
@@ -153,7 +258,7 @@ def chunk_python(
             chunks.extend(sliding_window(header, file_path, 0, max_size))
 
     prev_end = first_start
-    for start, end in top_level:
+    for start, end, node in top_level:
         # Gap between nodes (e.g., module-level assignments)
         if start > prev_end:
             gap = source[prev_end:start]
@@ -175,6 +280,13 @@ def chunk_python(
                         index_type="",
                     )
                 )
+        elif isinstance(node, ast.ClassDef):
+            chunks.extend(
+                _split_class(
+                    node, source, file_path, start, end, max_size,
+                    line_to_char, end_line_to_char,
+                )
+            )
         else:
             chunks.extend(
                 sliding_window(node_text, file_path, start, max_size)
@@ -318,7 +430,7 @@ def chunk_file(
     ]
 
 
-def get_supported_extensions() -> dict:
+def get_supported_extensions() -> dict[str, set[str]]:
     """Return extension sets for introspection.
 
     Returns:

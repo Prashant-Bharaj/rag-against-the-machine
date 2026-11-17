@@ -13,7 +13,7 @@ dependencies = [
     "accelerate>=0.26.0",
 ]
 
-[project.optional-dependencies]
+[dependency-groups]
 dev = ["flake8", "mypy", "pytest"]
 
 [build-system]
@@ -21,4 +21,11 @@ requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
-packages = ["src/student"]
+packages = ["src"]
+
+[tool.mypy]
+exclude = ["^\\.venv/", "^data/", "^context/"]
+
+[[tool.mypy.overrides]]
+module = ["bm25s", "bm25s.*", "Stemmer", "fire", "tqdm", "tqdm.*"]
+ignore_missing_imports = true

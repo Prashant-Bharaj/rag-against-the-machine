@@ -3,9 +3,68 @@
 import json
 import sys
 from pathlib import Path
-from typing import Optional
+from typing import NoReturn, Optional
 
 from tqdm import tqdm
+
+MAX_CHUNK_SIZE_LIMIT = 2000
+MIN_CHUNK_SIZE = 50
+INDEX_TYPES = ("code", "docs", "both")
+
+
+def _fail(message: str) -> NoReturn:
+    """Print an error message and exit with status 1.
+
+    Args:
+        message: Explanation shown to the user.
+    """
+    print(f"Error: {message}", file=sys.stderr)
+    sys.exit(1)
+
+
+def _check_k(k: object) -> int:
+    """Validate the ``--k`` option.
+
+    Args:
+        k: Value parsed by Fire.
+
+    Returns:
+        ``k`` as a non-negative integer.
+    """
+    if isinstance(k, bool) or not isinstance(k, int) or k < 0:
+        _fail(f"--k must be a non-negative integer, got {k!r}")
+    return k
+
+
+def _check_query(query: object) -> str:
+    """Normalise a query parsed by Fire into a string.
+
+    Fire turns some inputs into numbers or tuples (``search 42``,
+    ``search a,b``), so they are converted back to text.
+
+    Args:
+        query: Value parsed by Fire.
+
+    Returns:
+        The query as a stripped string.
+    """
+    if isinstance(query, (list, tuple)):
+        return " ".join(str(q) for q in query).strip()
+    return str(query).strip()
+
+
+def _check_index_type(index_type: object) -> str:
+    """Validate the ``--index_type`` option.
+
+    Args:
+        index_type: Value parsed by Fire.
+
+    Returns:
+        One of ``code``, ``docs`` or ``both``.
+    """
+    if index_type not in INDEX_TYPES:
+        _fail(f"--index_type must be one of {INDEX_TYPES}, got {index_type!r}")
+    return str(index_type)
 
 
 class StudentCLI:
@@ -20,7 +79,7 @@ class StudentCLI:
         evaluate        - Evaluate search results against ground truth
     """
 
-    REPO_PATH = "data/raw/vllm-0.10.1"
+    REPO_PATH = "data/raw"
     PROCESSED_PATH = "data/processed"
 
     def index(
@@ -29,15 +88,25 @@ class StudentCLI:
         processed_path: str = PROCESSED_PATH,
         max_chunk_size: int = 2000,
     ) -> None:
-        """Index the vLLM repository and save BM25 indexes.
+        """Index every file under ``repo_path`` and save BM25 indexes.
 
         Args:
-            repo_path: Path to the vLLM repository root.
+            repo_path: Corpus root (default ``data/raw``).
             processed_path: Directory to save processed indexes.
             max_chunk_size: Maximum chunk size in characters.
         """
-        from student.indexer import index as run_index
+        from src.indexer import index as run_index
 
+        if (
+            isinstance(max_chunk_size, bool)
+            or not isinstance(max_chunk_size, int)
+            or not MIN_CHUNK_SIZE <= max_chunk_size <= MAX_CHUNK_SIZE_LIMIT
+        ):
+            _fail(
+                "--max_chunk_size must be an integer between "
+                f"{MIN_CHUNK_SIZE} and {MAX_CHUNK_SIZE_LIMIT}, "
+                f"got {max_chunk_size!r}"
+            )
         if not Path(repo_path).exists():
             print(
                 f"Error: Repository not found at '{repo_path}'. "
@@ -63,9 +132,12 @@ class StudentCLI:
             processed_path: Directory containing BM25 indexes.
             index_type: Index to search — 'code', 'docs', or 'both'.
         """
-        from student.retriever import search as run_search
-        from student.models import StudentSearchResults, MinimalSearchResults
+        from src.retriever import search as run_search
+        from src.models import StudentSearchResults, MinimalSearchResults
 
+        query = _check_query(query)
+        k = _check_k(k)
+        index_type = _check_index_type(index_type)
         try:
             sources = run_search(query, k, processed_path, index_type)
         except FileNotFoundError as e:
@@ -76,7 +148,7 @@ class StudentCLI:
             search_results=[
                 MinimalSearchResults(
                     question_id="single",
-                    question_str=query,
+                    question=query,
                     retrieved_sources=sources,
                 )
             ],
@@ -101,15 +173,17 @@ class StudentCLI:
             processed_path: Directory containing BM25 indexes.
             index_type: Index to search — 'code', 'docs', or 'both'.
         """
-        from student.retriever import search as run_search
-        from student.models import (
+        from src.retriever import search as run_search
+        from src.models import (
             RagDataset,
             StudentSearchResults,
             MinimalSearchResults,
         )
 
-        dataset_path_obj = Path(dataset_path)
-        if not dataset_path_obj.exists():
+        k = _check_k(k)
+        index_type = _check_index_type(index_type)
+        dataset_path_obj = Path(str(dataset_path))
+        if not dataset_path_obj.is_file():
             print(
                 f"Error: Dataset file not found: {dataset_path}",
                 file=sys.stderr,
@@ -146,7 +220,7 @@ class StudentCLI:
             results.append(
                 MinimalSearchResults(
                     question_id=question.question_id,
-                    question_str=question.question,
+                    question=question.question,
                     retrieved_sources=sources,
                 )
             )
@@ -175,13 +249,16 @@ class StudentCLI:
             processed_path: Directory containing BM25 indexes.
             index_type: Index to search — 'code', 'docs', or 'both'.
         """
-        from student.retriever import (
+        from src.retriever import (
             search as run_search,
             get_chunks_for_sources,
         )
-        from student.generator import generate
-        from student.models import MinimalAnswer, StudentSearchResultsAndAnswer
+        from src.generator import generate
+        from src.models import MinimalAnswer, StudentSearchResultsAndAnswer
 
+        query = _check_query(query)
+        k = _check_k(k)
+        index_type = _check_index_type(index_type)
         try:
             sources = run_search(query, k, processed_path, index_type)
         except FileNotFoundError as e:
@@ -195,7 +272,7 @@ class StudentCLI:
             search_results=[
                 MinimalAnswer(
                     question_id="single",
-                    question_str=query,
+                    question=query,
                     retrieved_sources=sources,
                     answer=answer_text,
                 )
@@ -217,16 +294,16 @@ class StudentCLI:
             save_directory: Directory to save answered results.
             processed_path: Directory containing BM25 indexes.
         """
-        from student.retriever import get_chunks_for_sources
-        from student.generator import generate
-        from student.models import (
+        from src.retriever import get_chunks_for_sources
+        from src.generator import generate
+        from src.models import (
             StudentSearchResults,
             StudentSearchResultsAndAnswer,
             MinimalAnswer,
         )
 
-        src_path = Path(student_search_results_path)
-        if not src_path.exists():
+        src_path = Path(str(student_search_results_path))
+        if not src_path.is_file():
             print(
                 "Error: Search results file not found: "
                 f"{student_search_results_path}",
@@ -258,11 +335,11 @@ class StudentCLI:
             chunks = get_chunks_for_sources(
                 result.retrieved_sources, processed_path
             )
-            answer_text = generate(result.question_str, chunks)
+            answer_text = generate(result.question, chunks)
             answered.append(
                 MinimalAnswer(
                     question_id=result.question_id,
-                    question_str=result.question_str,
+                    question=result.question,
                     retrieved_sources=result.retrieved_sources,
                     answer=answer_text,
                 )
@@ -280,7 +357,7 @@ class StudentCLI:
 
     def evaluate(
         self,
-        student_answer_path: str,
+        student_search_results_path: str,
         dataset_path: str,
         k: int = 10,
         max_context_length: Optional[int] = None,
@@ -288,20 +365,23 @@ class StudentCLI:
         """Evaluate retrieval recall@k against ground truth.
 
         Args:
-            student_answer_path: Path to StudentSearchResults or
+            student_search_results_path: Path to StudentSearchResults or
                 StudentSearchResultsAndAnswer JSON.
             dataset_path: Path to the ground truth AnsweredQuestions dataset.
             k: Number of retrieved sources to evaluate at.
             max_context_length: Unused parameter kept for CLI compatibility.
         """
-        from student.models import RagDataset, StudentSearchResults
-        from student.evaluator import print_evaluation
+        from src.models import RagDataset, StudentSearchResults
+        from src.evaluator import print_evaluation
 
+        k = _check_k(k)
+        student_answer_path = str(student_search_results_path)
+        dataset_path = str(dataset_path)
         for p, name in [
-            (student_answer_path, "Student answers"),
+            (student_answer_path, "Student search results"),
             (dataset_path, "Ground truth dataset"),
         ]:
-            if not Path(p).exists():
+            if not Path(p).is_file():
                 print(f"Error: {name} file not found: {p}", file=sys.stderr)
                 sys.exit(1)
 

@@ -6,10 +6,10 @@
 
 A **Retrieval-Augmented Generation (RAG)** system that answers questions about the [vLLM](https://github.com/vllm-project/vllm) codebase. The system:
 
-1. **Ingests** the vLLM repository (Python source + Markdown docs) into a searchable BM25 index
-2. **Retrieves** the most relevant code/documentation chunks for any query
-3. **Generates** natural language answers using `Qwen/Qwen3-0.6B`
-4. **Evaluates** retrieval quality using recall@k metrics
+1. **Indexes** the vLLM repository (Python source + Markdown docs) into two BM25 indexes
+2. **Retrieves** the most relevant code/documentation snippets for any question, as exact source locations (file path + character range)
+3. **Generates** a grounded natural-language answer with `Qwen/Qwen3-0.6B`
+4. **Evaluates** retrieval quality with recall@k
 
 ## Instructions
 
@@ -21,69 +21,43 @@ A **Retrieval-Augmented Generation (RAG)** system that answers questions about t
 ### Installation
 
 ```bash
-# Install dependencies
-make install
-# or: uv sync
+make install        # runs: uv sync (installs runtime + dev tools)
 ```
 
-### Setup — vLLM Repository
+### Expected layout
 
-Extract the vLLM archive to `data/raw/`:
-
-```bash
-mkdir -p data/raw
-unzip vllm-0.10.1.zip -d data/raw/
-# Result: data/raw/vllm-0.10.1/
+```
+src/                         Python package, run with: uv run python -m src <command>
+data/raw/vllm-0.10.1/        corpus (unzip vllm-0.10.1.zip -d data/raw/)
+data/processed/              index written by the `index` command
+data/datasets/{UnansweredQuestions,AnsweredQuestions}/
+data/output/search_results/<DatasetScope>/
+data/output/search_results_and_answer/<DatasetScope>/
 ```
 
-### Index the Repository
+### Commands
+
+Every command is `uv run python -m src <command> [options]`. All input and output paths are CLI options.
+
+| Command | Purpose |
+|---------|---------|
+| `index --max_chunk_size 2000` | Chunk `data/raw/` and build the indexes under `data/processed/` |
+| `search "<query>" --k 10` | Top-k sources for one query |
+| `search_dataset --dataset_path <file> --k 10 --save_directory <dir>` | Search every question of a dataset, write `StudentSearchResults` JSON |
+| `answer "<query>" --k 10` | Retrieve and answer one question |
+| `answer_dataset --student_search_results_path <file> --save_directory <dir>` | Answer every question of a search-results file, write `StudentSearchResultsAndAnswer` JSON |
+| `evaluate --student_search_results_path <file> --dataset_path <file> --k 10` | Report recall@1/3/5/10 against a ground-truth dataset (for development; the official score comes from the moulinette) |
+
+Optional on search commands: `--processed_path` (index location) and `--index_type code|docs|both`. `search_dataset` picks the code or docs index from the dataset file name when `--index_type` is `both`.
+
+### Other Makefile rules
 
 ```bash
-uv run python -m student index --max_chunk_size 2000
-```
-
-Output: indexes saved to `data/processed/`.
-
-### Search
-
-```bash
-# Single query
-uv run python -m student search "How to configure OpenAI server?" --k 10
-
-# Dataset of questions
-uv run python -m student search_dataset \
-  --dataset_path data/datasets/UnansweredQuestions/dataset_docs_public.json \
-  --k 10 \
-  --save_directory data/output/search_results
-```
-
-### Answer
-
-```bash
-# Single question
-uv run python -m student answer "How to configure OpenAI server?" --k 10
-
-# Full dataset
-uv run python -m student answer_dataset \
-  --student_search_results_path data/output/search_results/dataset_docs_public.json \
-  --save_directory data/output/search_results_and_answer
-```
-
-### Evaluate
-
-```bash
-uv run python -m student evaluate \
-  --student_answer_path data/output/search_results/dataset_docs_public.json \
-  --dataset_path data/datasets/AnsweredQuestions/dataset_docs_public.json \
-  --k 10
-```
-
-### Other Commands
-
-```bash
-make lint        # flake8 + mypy
-make clean       # remove __pycache__, .mypy_cache
-make debug       # run with pdb
+make run          # show the CLI help
+make lint         # flake8 . + mypy . with the subject's flags
+make lint-strict  # flake8 . + mypy . --strict
+make debug        # run under pdb
+make clean        # remove __pycache__, .mypy_cache, .pytest_cache
 ```
 
 ---
@@ -91,242 +65,187 @@ make debug       # run with pdb
 ## System Architecture
 
 ```
-┌────────────────────────────────────────────────┐
-│                  CLI (Fire)                    │
-│  index | search | answer | evaluate | ...      │
-└────────┬───────────────────────┬───────────────┘
-         │                       │
-    ┌────▼─────┐          ┌──────▼──────┐
-    │ Indexer  │          │  Retriever  │
-    │ (BM25)   │          │  (BM25 x2) │
-    └────┬─────┘          └──────┬──────┘
-         │                       │
-    ┌────▼────────────────────────▼──────┐
-    │         data/processed/            │
-    │  bm25_index/code/  bm25_index/docs/│
-    │  chunks/code_chunks.jsonl          │
-    │  chunks/docs_chunks.jsonl          │
-    └───────────────────┬────────────────┘
-                        │
-                  ┌─────▼──────┐
-                  │ Generator  │
-                  │ Qwen3-0.6B │
-                  └─────┬──────┘
-                        │
-                  ┌─────▼──────┐
-                  │ Evaluator  │
-                  │ Recall@k   │
-                  └────────────┘
+            ┌──────────────────────── CLI (Python Fire, src/cli.py) ───────────────────────┐
+            │  index │ search │ search_dataset │ answer │ answer_dataset │ evaluate        │
+            └────┬────────────────────┬─────────────────────────┬─────────────────┬───────┘
+                 │                    │                         │                 │
+          ┌──────▼──────┐      ┌──────▼──────┐           ┌──────▼──────┐   ┌──────▼──────┐
+          │  Chunker    │      │  Retriever  │──chunks──▶│  Generator  │   │  Evaluator  │
+          │ AST / Markdown│    │  BM25 x 2   │           │ Qwen3-0.6B  │   │  recall@k   │
+          └──────┬──────┘      └──────▲──────┘           └─────────────┘   └─────────────┘
+                 │                    │
+          ┌──────▼──────┐      ┌──────┴───────────────────────────────┐
+          │  Indexer    │─────▶│ data/processed/                      │
+          │ + Tokenizer │      │   bm25_index/{code,docs}/            │
+          └─────────────┘      │   chunks/{code,docs}_chunks.jsonl    │
+                               └──────────────────────────────────────┘
 ```
 
-**Pipeline flow:**
-1. **Chunker** splits `.py` files (AST-based) and `.md` files (heading-based) into overlapping chunks
-2. **Indexer** builds two BM25 indexes: one for code, one for docs
-3. **Retriever** queries both indexes, normalizes scores, merges, returns top-k
-4. **Generator** formats retrieved chunks as context and queries Qwen3-0.6B
-5. **Evaluator** computes recall@k with 5% character-overlap threshold
+| Module | Role |
+|--------|------|
+| `src/chunker.py` | Two chunking strategies (Python AST, Markdown headings) + sliding-window fallback |
+| `src/tokenizer.py` | Identifier-aware tokenizer shared by indexing and querying |
+| `src/indexer.py` | Walks `data/raw/`, chunks every file, builds and saves both BM25 indexes |
+| `src/retriever.py` | Loads indexes once per process, scores a query, returns `MinimalSource`s |
+| `src/generator.py` | Builds a grounded prompt from the top chunks and generates with Qwen3-0.6B |
+| `src/evaluator.py` | recall@k for the `evaluate` command |
+| `src/models.py` | Pydantic models exchanged between stages (subject's models + internal `Chunk`) |
 
 ---
 
 ## Chunking Strategy
 
-Two dedicated strategies, dispatched by file extension:
+Every chunk is at most `--max_chunk_size` characters (default and maximum 2000, minimum 50), because the moulinette rejects any source longer than 2000 characters. Chunk offsets are exact character positions in the original file.
 
-### Python Code (`.py`, `.pyi`)
+### Python code (`.py`, `.pyi`)
 
-Uses Python's `ast` module to extract **function and class definitions** as atomic chunks:
+- Parse the file with `ast` and cut at **top-level function and class boundaries** (decorators included).
+- A definition that fits in the limit becomes one chunk.
+- An **oversized class** is split along its members: header/docstring/attributes and each method become segments, which are packed greedily into chunks of up to `max_chunk_size`. Nested classes are split recursively; a single oversized method falls back to the sliding window.
+- Every chunk produced from a class remembers the class name (`context`), which is added to its index text, so "the `usage` property of the KV cache manager" can match a method chunk that never names its class.
+- Module-level code between definitions (imports, constants) gets its own chunks.
+- Files that fail to parse fall back to the sliding window.
 
-- Parse AST, collect `FunctionDef`, `AsyncFunctionDef`, `ClassDef` nodes
-- Convert `node.lineno` / `node.end_lineno` to character offsets via a precomputed line-offset array
-- Class methods stay together with their class body (no splitting)
-- Gap code (imports, module-level assignments) becomes its own chunk
-- Files with syntax errors fall back to sliding window
+### Markdown / text (`.md`, `.rst`, `.txt`)
 
-### Markdown/Text (`.md`, `.rst`, `.txt`)
+1. Split on headings (`(?=\n#{1,6} )`), so each heading + body is a candidate section.
+2. Sections over the limit are split on blank lines (paragraphs).
+3. Paragraphs still over the limit use the sliding window.
 
-Splits on **heading boundaries** first, then on **paragraph breaks**:
+### Sliding window fallback
 
-1. Split on regex `(?=\n#{1,6} )` — each heading + body is a candidate section
-2. If a section exceeds `max_chunk_size`, split further on `\n\n`
-3. Oversized paragraphs fall back to sliding window
-
-### Sliding Window Fallback
-
-Used whenever a chunk would exceed `max_chunk_size` (default 2000):
-- Window stride = `max_size - 200` (200 char overlap between windows)
-- Ensures no content falls between window boundaries
-
-### Configurable Limit
-
-```bash
-uv run python -m student index --max_chunk_size 1500
-```
+Windows of `max_chunk_size` characters with a 200-character overlap (capped at a quarter of the window for small chunk sizes, so the window always advances).
 
 ---
 
 ## Retrieval Method
 
-**BM25** (via [`bm25s`](https://github.com/xhluca/bm25s)) — a fast, pure-Python BM25 implementation.
+**BM25** via [`bm25s`](https://github.com/xhluca/bm25s), with two separate indexes (code and docs).
 
-### Dual-Index Architecture
+### Tokenization
 
-Two separate BM25 indexes to optimize for different token distributions:
+Questions name things the way people talk ("the fused batched MoE layer", "`GPUModelRunner`", "the keye model"), while code writes `fused_batched_moe.py`, `class GPUModelRunner`, `_MAX_IMAGE_SIZE`. A plain word tokenizer cannot connect these, so `src/tokenizer.py` does, for both chunks and queries:
 
-| Index | Files | Stopwords |
-|-------|-------|-----------|
-| `code` | `.py`, `.pyi` | None (identifiers matter) |
-| `docs` | `.md`, `.rst`, `.txt` | English stopwords |
+1. Extract identifiers and numbers.
+2. Keep each compound identifier whole **and** split it on `_` and camelCase: `GPUModelRunner` → `gpumodelrunner`, `gpu`, `model`, `runner`.
+3. Lowercase, drop English stopwords, stem with PyStemmer.
 
-### Search Algorithm
+### Index text
 
-For a query with `k` results:
-1. Query the **code** index for top-k results with scores
-2. Query the **docs** index for top-k results with scores
-3. Normalize each set of scores to [0, 1] by dividing by the maximum
-4. Merge both lists, sort by normalized score descending
-5. Return top-k `MinimalSource` objects
+Each chunk is indexed as **file path + enclosing class + content**. The path (without the shared `data/raw/vllm-0.10.1/` prefix) contributes tokens like `model_executor`, `models`, `keye`, which match questions that name a module or model rather than a function.
 
-Querying each index for the full k (not k/2) ensures cross-domain questions (e.g., a question about a `.md` file) still get full coverage.
+### Search
+
+1. Tokenize the query; drop tokens not in the index vocabulary.
+2. Query the code index, the docs index, or both (`--index_type`; `search_dataset` chooses from the dataset file name).
+3. Fetch extra candidates (4 × k, at least 50) and halve the score of chunks under `tests/` or `benchmarks/`: they repeat the identifiers of the code they exercise and would otherwise outrank the implementation (e.g. `tests/conftest.py` sets `trust_remote_code=True`, the library default is `False`). They stay in the index, so questions about tests still work.
+4. With both indexes, scores are normalised to [0, 1] per index, merged and sorted.
+5. Return the top-k chunks as `MinimalSource` (file path + character range).
 
 ---
 
 ## Performance Analysis
 
-### Target Metrics
+Measured with the provided moulinette on the public datasets (`--k 10 --max_context_length 2000`), CPU only:
 
-| Metric | Target | Notes |
-|--------|--------|-------|
-| Recall@5 (docs) | ≥ 55% | BM25 on heading-chunked docs |
-| Recall@5 (code) | ≥ 45% | BM25 on AST-chunked code |
-| Indexing time | ≤ 5 min | One-time cost |
-| Cold start | ≤ 60 s | Model loading + first query |
-| Warm retrieval (1000 q) | ≤ 90 s | BM25 is fast; ~90ms/query |
+### Recall (moulinette)
 
-### Latency Benchmark (Generation Backend)
+| Dataset | Recall@1 | Recall@3 | **Recall@5** | Recall@10 | Target @5 |
+|---------|---------:|---------:|-------------:|----------:|----------:|
+| Docs (100 q) | 62.0% | 82.0% | **87.0%** | 92.0% | ≥ 80% |
+| Code (99 q)  | 62.6% | 82.8% | **87.9%** | 91.9% | ≥ 50% |
 
-Measured on this repository with:
+### Effect of chunk size
 
-```bash
-STUDENT_GENERATION_BACKEND=<backend> \
-uv run python -m student answer "What method needs to be overridden in BaseProcessingInfo?" --k 5 --index_type docs
-```
+| `--max_chunk_size` | Chunks (code / docs) | Docs R@5 | Code R@5 | Docs R@1 | Code R@1 |
+|-------------------:|---------------------:|---------:|---------:|---------:|---------:|
+| 2000 (default) | 19,007 / 2,948 | 86.0% | 86.9% | 62.0% | 61.6% |
+| 500 | 55,888 / 5,871 | 84.0% | 89.9% | 49.0% | 55.6% |
 
-| Backend | Measured latency | Notes |
-|---------|------------------|-------|
-| `auto` | ~1.35s | Uses low-latency path (OpenAI-compatible if configured, otherwise extractive fallback) |
-| `hf_local` | ~86.49s | Loads local `Qwen/Qwen3-0.6B` via transformers pipeline; high cold-start cost |
+Smaller chunks help code at k=5 (narrower spans around a specific constant or argument) but hurt the top-1 result, especially for docs, where a whole section is the natural unit. 2000 is kept as the default.
 
-For defense constraints, `auto` is the default to keep latency low. For full local LLM generation, set `STUDENT_GENERATION_BACKEND=hf_local`.
+### Effect of the tokenizer (code dataset, chunk size 2000)
 
-### BM25 Strengths for This Task
+| Tokenization | Code R@5 | Docs R@5 |
+|--------------|---------:|---------:|
+| bm25s default tokenizer, content only | 48.5% | 85.0% |
+| Identifier splitting + stemming + path and class context | 86.9% | 86.0% |
+| + `tests/` and `benchmarks/` scores × 0.5 | **87.9%** | **87.0%** |
 
-- Exact term matching is very effective for code queries (function names, class names, API parameters)
-- No GPU required for retrieval
-- Retrieval of 1000 queries completes in seconds once indexes are loaded
+### Speed
+
+| Step | Measured | Limit |
+|------|---------:|------:|
+| Indexing the whole corpus (`index`) | ~10 s | 5 min |
+| `search_dataset`, 100 questions, including index load | ~1.6 s | 90 s for 200 questions |
+| Qwen3-0.6B model load (once per process) | ~10–30 s | — |
+| Answer generation, Qwen3-0.6B on a 6-core laptop CPU | ~15–35 s per question | — |
+
+Generation time on CPU is dominated by reading the prompt (~100 tokens/s for the prefill), so the context is capped at 1,536 tokens from the top 5 chunks and answers at 128 new tokens. When a CUDA GPU is available the model runs on it automatically in float16; a full single `answer` command (index load + model load + generation) took ~17 s on an RTX 2060.
+
+### Where it still misses
+
+The remaining code misses are mostly questions whose wording shares few tokens with the code (e.g. "what dimension handling is applied to 2D vision embeddings") or where the right file is found but a different part of a very large file is ranked first.
 
 ---
 
 ## Design Decisions
 
-1. **BM25 over TF-IDF** — BM25 provides better recall on variable-length documents due to document length normalization. `bm25s` is significantly faster than scikit-learn's TF-IDF at query time.
-
-2. **Dual index, not single** — Keeping code and docs separate avoids vocabulary pollution. Code identifiers (e.g., `vllm_engine`) are treated as meaningful tokens without English stopword removal.
-
-3. **AST chunking** — Chunking at function/class boundaries preserves semantic units. A retriever finding a function body returns the entire function, which is the correct context for a code question.
-
-4. **Module-level singletons** — Indexes and the generation model are loaded once per process. This is critical for meeting the 90s/1000q throughput requirement.
-
-5. **`/no_think` in prompt** — Qwen3 models have a "thinking" mode that adds significant latency. Disabling it is necessary to meet the 2s/answer target.
-
-6. **Pydantic v2** — Used throughout for data validation, JSON serialization, and type safety in the pipeline.
+1. **BM25 over TF-IDF**: length normalisation suits chunks of very different sizes, and `bm25s` scores hundreds of queries per second on CPU.
+2. **Separate code and docs indexes**: the two corpora have very different vocabularies and document lengths; keeping them apart keeps IDF statistics meaningful for each.
+3. **Identifier-aware tokenizer instead of embeddings**: most code questions quote or paraphrase identifiers. Splitting identifiers and indexing file paths raised code recall@5 from 48.5% to over 85% while keeping retrieval purely lexical, CPU-only and fast.
+4. **AST chunking with member-level splitting of large classes**: returns whole functions/methods as context, and avoids blind 2000-character windows that cut a method away from its class.
+5. **Module-level singletons**: indexes and the Qwen model are loaded once per process, so dataset commands pay the load cost once.
+6. **Grounded prompt for Qwen3-0.6B**: numbered snippets with their file paths, a token budget measured with the model's own tokenizer, greedy decoding, thinking disabled through the chat template (`enable_thinking=False`), and numbered rules: copy values exactly, prefer library code over tests, and reply with one fixed sentence when the context lacks the answer. A first version phrased that last rule loosely; the 0.6B model then appended "the context does not contain the answer" to correct answers and invented values when the right file was not retrieved. The strict wording fixed both on the test questions.
+7. **Never crash**: CLI arguments are validated (`k`, `max_chunk_size`, `index_type`, paths, JSON), every command reports errors on one line, and the generator falls back to an extractive answer if the model cannot be loaded.
+8. **Pydantic v2** for every structure exchanged between stages.
 
 ---
 
 ## Challenges Faced
 
-1. **AST line-to-character offset conversion** — `ast` gives 1-based line numbers; converting to character offsets requires a precomputed line-offset array. Off-by-one errors here silently corrupt chunk boundaries.
-
-2. **Encoding errors** — vLLM contains files with non-UTF-8 characters. Using `errors='replace'` prevents crashes but means chunk character indices are computed on the replaced string. This is acceptable since the evaluator uses the same character positions.
-
-3. **bm25s k clamping** — If `k > corpus_size`, `bm25s.retrieve()` raises an error. All retrieval calls clamp k to `min(k, corpus_size)`.
-
-4. **Transformers `do_sample=False` API** — In transformers ≥ 4.45, greedy decoding (`do_sample=False`) requires explicitly setting `temperature=None` and `top_p=None` to avoid warnings/errors.
-
-5. **Pydantic Union deserialization** — `RagDataset.rag_questions` contains both `AnsweredQuestion` and `UnansweredQuestion`. Pydantic v2 tries each Union member in order; putting `AnsweredQuestion` first ensures the richer model is attempted first.
+1. **Code recall below target**: the default BM25 tokenizer treats `trust_remote_code` or `GPUModelRunner` as single opaque words and ignores file names, so many code questions retrieved the wrong file. Analysing the misses led to the identifier-splitting tokenizer and path tokens.
+2. **Large classes**: classes such as `GPUModelRunner` are tens of thousands of characters; slicing them into fixed windows separated methods from their class name. Member-level splitting with class context fixed most "right file, wrong span" misses.
+3. **AST line-to-character conversion**: `ast` gives 1-based line numbers; converting them to character offsets needs a precomputed line-offset table, and off-by-one errors silently corrupt spans.
+4. **Sliding-window overlap**: with a chunk size smaller than the overlap, the window never advanced. The overlap is now capped relative to the window size.
+5. **Output schema change**: an earlier moulinette expected `question_str`; the current subject and moulinette use `question`, which the models now follow.
+6. **Encoding errors**: some files contain non-UTF-8 bytes; they are read with `errors="replace"` so indexing never crashes.
 
 ---
 
 ## Example Usage
 
 ```bash
-# Full workflow
 make install
+mkdir -p data/raw && unzip vllm-0.10.1.zip -d data/raw/
 
-# Extract vLLM repo
-unzip vllm-0.10.1.zip -d data/raw/
+# 1. Index
+uv run python -m src index --max_chunk_size 2000
 
-# Index
-uv run python -m student index --max_chunk_size 2000
-
-# Search
-uv run python -m student search "What is the sampling parameter for temperature?" --k 5
-
-# Search dataset
-uv run python -m student search_dataset \
+# 2. Search a dataset (scope the output directory by dataset)
+uv run python -m src search_dataset \
   --dataset_path data/datasets/UnansweredQuestions/dataset_docs_public.json \
   --k 10 \
-  --save_directory data/output/search_results
+  --save_directory data/output/search_results/UnansweredQuestions
 
-# Evaluate
-uv run python -m student evaluate \
-  --student_answer_path data/output/search_results/dataset_docs_public.json \
+# 3. Score with the moulinette (official) or with the built-in evaluator
+./moulinette evaluate_student_search_results \
+  data/output/search_results/UnansweredQuestions/dataset_docs_public.json \
+  data/datasets/AnsweredQuestions/dataset_docs_public.json \
+  --k 10 --max_context_length 2000
+uv run python -m src evaluate \
+  --student_search_results_path data/output/search_results/UnansweredQuestions/dataset_docs_public.json \
   --dataset_path data/datasets/AnsweredQuestions/dataset_docs_public.json \
   --k 10
 
-# Answer a question
-uv run python -m student answer "How to use beam search in vLLM?" --k 10
+# 4. Generate answers
+uv run python -m src answer_dataset \
+  --student_search_results_path data/output/search_results/UnansweredQuestions/dataset_docs_public.json \
+  --save_directory data/output/search_results_and_answer/UnansweredQuestions
 
-# Generate answers for dataset
-uv run python -m student answer_dataset \
-  --student_search_results_path data/output/search_results/dataset_docs_public.json \
-  --save_directory data/output/search_results_and_answer
-```
-
----
-
-## Known Deviations from the Subject Spec
-
-### `question_str` instead of `question` in `MinimalSearchResults`
-
-The subject PDF specifies a field named `question` in the `MinimalSearchResults` model. This implementation uses `question_str` instead:
-
-```python
-class MinimalSearchResults(BaseModel):
-    question_id: str
-    question_str: str   # spec says 'question', moulinette requires 'question_str'
-    retrieved_sources: List[MinimalSource]
-```
-
-The moulinette binary validates output JSON against `question_str`, not `question`. Using `question` causes the moulinette to reject the submission. This was verified empirically — the moulinette README uses `question_str` while the PDF uses `question`. The implementation follows what the moulinette actually requires.
-
-### Answer generation latency with local model
-
-The subject requires answers in ≤ 2 seconds per question and specifies `Qwen/Qwen3-0.6B` as the generation model. Running Qwen locally via the `transformers` pipeline takes significantly longer than 2 seconds per answer and has a cold-start cost exceeding the 60-second limit.
-
-The default backend (`auto`) resolves this by preferring a low-latency OpenAI-compatible endpoint (e.g., a running vLLM server) and falling back to an extractive answer if none is configured. The extractive fallback meets the latency constraint but does not use Qwen for generation.
-
-To use Qwen/Qwen3-0.6B locally (at the cost of latency):
-
-```bash
-STUDENT_GENERATION_BACKEND=hf_local uv run python -m student answer "your question"
-```
-
-To use a vLLM-served Qwen instance (meets both constraints):
-
-```bash
-STUDENT_OPENAI_BASE_URL=http://localhost:8000/v1 \
-STUDENT_OPENAI_MODEL=Qwen/Qwen3-0.6B \
-uv run python -m student answer_dataset ...
+# Single questions
+uv run python -m src search "How to configure the OpenAI compatible server?" --k 5
+uv run python -m src answer "What is the default value of trust_remote_code in the LLM class?" --k 5
 ```
 
 ---
@@ -335,23 +254,26 @@ uv run python -m student answer_dataset ...
 
 ### Documentation
 - [vLLM Documentation](https://docs.vllm.ai/)
-- [BM25 — Wikipedia](https://en.wikipedia.org/wiki/Okapi_BM25)
+- [Okapi BM25 (Wikipedia)](https://en.wikipedia.org/wiki/Okapi_BM25)
 - [bm25s library](https://github.com/xhluca/bm25s)
-- [Qwen3 Model Card](https://huggingface.co/Qwen/Qwen3-0.6B)
-- [Transformers Documentation](https://huggingface.co/docs/transformers)
-- [Pydantic v2 Documentation](https://docs.pydantic.dev/latest/)
+- [Qwen3-0.6B model card](https://huggingface.co/Qwen/Qwen3-0.6B)
+- [Transformers documentation](https://huggingface.co/docs/transformers)
+- [Pydantic v2 documentation](https://docs.pydantic.dev/latest/)
 - [Python Fire](https://github.com/google/python-fire)
+- [Python `ast` module](https://docs.python.org/3/library/ast.html)
 
 ### Papers
-- [Dense Passage Retrieval (DPR)](https://arxiv.org/abs/2004.04906)
-- [RAG: Retrieval-Augmented Generation for Knowledge-Intensive NLP Tasks](https://arxiv.org/abs/2005.11401)
+- [Retrieval-Augmented Generation for Knowledge-Intensive NLP Tasks (Lewis et al., 2020)](https://arxiv.org/abs/2005.11401)
+- [The Probabilistic Relevance Framework: BM25 and Beyond (Robertson & Zaragoza, 2009)](https://www.staff.city.ac.uk/~sbrp622/papers/foundations_bm25_review.pdf)
+- [Dense Passage Retrieval (Karpukhin et al., 2020)](https://arxiv.org/abs/2004.04906)
 
 ### AI Usage
 
 AI (Claude) was used in this project for:
-- **Architectural planning**: designing the dual-index strategy, discussing trade-offs between BM25 and dense retrieval
-- **Boilerplate generation**: generating Pydantic model stubs and docstrings
-- **Debugging assistance**: identifying the `do_sample=False` + `temperature=None` issue in transformers
-- **Code review**: checking edge cases in the AST chunker (syntax error fallback, line offset conversion)
+- **Architectural planning**: the dual-index design and BM25 vs dense retrieval trade-offs
+- **Retrieval analysis**: classifying recall misses (wrong file vs wrong span), which motivated the identifier-aware tokenizer, path tokens and member-level class splitting
+- **Spec compliance**: checking the project against the v2.0 subject (CLI entry point, output schema, Makefile lint rule, edge cases)
+- **Boilerplate**: Pydantic model stubs and docstrings
+- **Debugging**: the transformers greedy-decoding arguments, the sliding-window overlap bug, mypy errors
 
 All AI-generated content was reviewed, tested, and understood before inclusion.

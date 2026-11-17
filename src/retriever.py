@@ -1,13 +1,21 @@
 """BM25 retrieval with dual-index (code + docs) support."""
 
+import re
 from pathlib import Path
 from typing import List, Optional, Tuple
 
 import bm25s
 import numpy as np
+import numpy.typing as npt
 
-from student.indexer import load_index
-from student.models import Chunk, MinimalSource
+from src.indexer import load_index
+from src.models import Chunk, MinimalSource
+from src.tokenizer import tokenize
+
+CANDIDATE_FACTOR = 4
+MIN_CANDIDATES = 50
+SECONDARY_PATH_WEIGHT = 0.5
+_SECONDARY_PATH = re.compile(r"vllm-[\d.]+/(tests|benchmarks)/")
 
 # Module-level singletons — loaded once per process
 _code_retriever: Optional[bm25s.BM25] = None
@@ -51,7 +59,6 @@ def _query_index(
     chunks: List[Chunk],
     query: str,
     k: int,
-    stopwords: Optional[str] = None,
 ) -> List[Tuple[Chunk, float]]:
     """Query a single BM25 index and return ranked (chunk, score) pairs.
 
@@ -60,28 +67,52 @@ def _query_index(
         chunks: Chunk list corresponding to the retriever corpus.
         query: Search query string.
         k: Number of results to return.
-        stopwords: Stopword config passed to bm25s.tokenize.
 
     Returns:
         List of (Chunk, score) tuples sorted by descending score.
     """
-    effective_k = min(k, len(chunks))
-    if effective_k == 0:
+    if k <= 0 or not chunks:
+        return []
+    # Fetch extra candidates so re-weighting can promote lower-ranked ones.
+    candidates = min(max(k * CANDIDATE_FACTOR, MIN_CANDIDATES), len(chunks))
+
+    vocab = retriever.vocab_dict
+    query_tokens = [t for t in tokenize(query) if t in vocab]
+    if not query_tokens:
         return []
 
-    tokenized_query = bm25s.tokenize(
-        [query], stopwords=stopwords, show_progress=False
+    results, scores = retriever.retrieve(
+        [query_tokens], k=candidates, show_progress=False
     )
-    results, scores = retriever.retrieve(tokenized_query, k=effective_k)
 
-    indices: np.ndarray = results[0]
-    score_values: np.ndarray = scores[0]
+    indices: npt.NDArray[np.int64] = results[0]
+    score_values: npt.NDArray[np.float32] = scores[0]
 
     pairs: List[Tuple[Chunk, float]] = []
     for idx, score in zip(indices, score_values):
-        pairs.append((chunks[int(idx)], float(score)))
+        chunk = chunks[int(idx)]
+        pairs.append((chunk, float(score) * path_weight(chunk.file_path)))
 
-    return pairs
+    pairs.sort(key=lambda pair: pair[1], reverse=True)
+    return pairs[:k]
+
+
+def path_weight(file_path: str) -> float:
+    """Return the score multiplier for a file based on its location.
+
+    Tests and benchmarks repeat the identifiers of the code they
+    exercise, so they often outrank the implementation for questions
+    about it. They are kept in the index but down-weighted.
+
+    Args:
+        file_path: Corpus-relative file path.
+
+    Returns:
+        Multiplier applied to the BM25 score.
+    """
+    if _SECONDARY_PATH.search(file_path):
+        return SECONDARY_PATH_WEIGHT
+    return 1.0
 
 
 def _normalize_scores(
@@ -146,15 +177,11 @@ def search(
     all_pairs: List[Tuple[Chunk, float]] = []
 
     if index_type in ("code", "both"):
-        code_pairs = _query_index(
-            _code_retriever, _code_chunks, query, k, stopwords=None
-        )
+        code_pairs = _query_index(_code_retriever, _code_chunks, query, k)
         all_pairs.extend(_normalize_scores(code_pairs))
 
     if index_type in ("docs", "both"):
-        docs_pairs = _query_index(
-            _docs_retriever, _docs_chunks, query, k, stopwords="en"
-        )
+        docs_pairs = _query_index(_docs_retriever, _docs_chunks, query, k)
         all_pairs.extend(_normalize_scores(docs_pairs))
 
     # Sort by normalized score descending, take top k

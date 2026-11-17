@@ -2,7 +2,7 @@
 
 from typing import Dict
 
-from student.models import (
+from src.models import (
     AnsweredQuestion,
     MinimalSource,
     RagDataset,
